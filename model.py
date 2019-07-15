@@ -1137,7 +1137,7 @@ def compute_losses(rpn_match, rpn_bbox, rpn_class_logits, rpn_pred_bbox, target_
 ############################################################
 
 def load_image_gt(dataset, config, image_id, augment=False,
-                  use_mini_mask=False):
+                  use_mini_mask=False, augmentation=None):
     """Load and return ground truth data for an image (image, mask, bounding boxes).
 
     augment: If true, apply random image augmentation. Currently, only
@@ -1173,6 +1173,34 @@ def load_image_gt(dataset, config, image_id, augment=False,
         if random.randint(0, 1):
             image = np.fliplr(image)
             mask = np.fliplr(mask)
+
+    if augmentation:
+        import imgaug
+
+        # Augmenters that are safe to apply to masks
+        # Some, such as Affine, have settings that make them unsafe, so always
+        # test your augmentation on masks
+        MASK_AUGMENTERS = ["Sequential", "SomeOf", "OneOf", "Sometimes",
+                           "Fliplr", "Flipud", "CropAndPad",
+                           "Affine", "PiecewiseAffine"]
+
+        def hook(images, augmenter, parents, default):
+            """Determines which augmenters to apply to masks."""
+            return augmenter.__class__.__name__ in MASK_AUGMENTERS
+
+        # Store shapes before augmentation to compare
+        image_shape = image.shape
+        mask_shape = mask.shape
+        # Make augmenters deterministic to apply similarly to images and masks
+        det = augmentation.to_deterministic()
+        image = det.augment_image(image)
+        mask = det.augment_image(mask.astype(np.uint8),
+                                 hooks=imgaug.HooksImages(activator=hook))
+        # Verify that shapes didn't change
+        assert image.shape == image_shape, "Augmentation shouldn't change image size"
+        assert mask.shape == mask_shape, "Augmentation shouldn't change mask size"
+        # Change mask back to bool
+        mask = mask.astype(np.bool)
 
     # Bounding boxes. Note that some boxes might be all zeros
     # if the corresponding mask got cropped out.
@@ -1306,7 +1334,7 @@ def build_rpn_targets(image_shape, anchors, gt_class_ids, gt_boxes, config):
     return rpn_match, rpn_bbox
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, dataset, config, augment=True):
+    def __init__(self, dataset, config, augment=True, augmentation=None):
         """A generator that returns images and corresponding target class ids,
             bounding box deltas, and masks.
 
@@ -1342,6 +1370,7 @@ class Dataset(torch.utils.data.Dataset):
         self.dataset = dataset
         self.config = config
         self.augment = augment
+        self.augmentation = augmentation
 
         # Anchors
         # [anchor_count, (y1, x1, y2, x2)]
@@ -1356,7 +1385,7 @@ class Dataset(torch.utils.data.Dataset):
         image_id = self.image_ids[image_index]
         image, image_metas, gt_class_ids, gt_boxes, gt_masks = \
             load_image_gt(self.dataset, self.config, image_id, augment=self.augment,
-                          use_mini_mask=self.config.USE_MINI_MASK)
+                          use_mini_mask=self.config.USE_MINI_MASK, augmentation=self.augmentation)
 
         # Skip images that have no instances. This can happen in cases
         # where we train on a subset of classes and the image doesn't
@@ -1733,7 +1762,7 @@ class MaskRCNN(nn.Module):
 
             return [rpn_class_logits, rpn_bbox, target_class_ids, mrcnn_class_logits, target_deltas, mrcnn_bbox, target_mask, mrcnn_mask]
 
-    def train_model(self, train_dataset, val_dataset, learning_rate, epochs, layers):
+    def train_model(self, train_dataset, val_dataset, learning_rate, epochs, layers, augmentation=None):
         """Train the model.
         train_dataset, val_dataset: Training and validation Dataset objects.
         learning_rate: The learning rate to train with
@@ -1766,7 +1795,7 @@ class MaskRCNN(nn.Module):
             layers = layer_regex[layers]
 
         # Data generators
-        train_set = Dataset(train_dataset, self.config, augment=True)
+        train_set = Dataset(train_dataset, self.config, augment=True, augmentation=augmentation)
         train_generator = torch.utils.data.DataLoader(train_set, batch_size=1, shuffle=True, num_workers=4)
         val_set = Dataset(val_dataset, self.config, augment=True)
         val_generator = torch.utils.data.DataLoader(val_set, batch_size=1, shuffle=True, num_workers=4)
